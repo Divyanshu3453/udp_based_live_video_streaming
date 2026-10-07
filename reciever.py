@@ -1,146 +1,265 @@
-import cv2
+import queue
 import socket
 import struct
-import numpy as np
+import threading
 import time
+
+from construction import construct_frame
+from frame_recovery.frame_recover import frame_recovery, warm_up
+from metrics import metrics
 
 
 HOST = "127.0.0.1"
 PORT = 9001
 
+# Largest missing window handed to RIFE in one go.
+# At 30 FPS, 30 frames is about 1 second.
+# Longer gaps are discarded and we wait for a new valid reference.
+MAX_PENDING_MISSING = 30
 
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.connect((HOST, PORT))
-
-print("Connected to Rust receiver")
-print("Waiting for video frames...")
-
-
-frame_count = 0
-start_time = time.time()
-
-
-while True:
-
-    # ================================================
-    # 1. RECEIVE HEADER
-    # ================================================
-
-    t1 = time.perf_counter()
-
-    header = b""
-
-    while len(header) < 4:
-        data = sock.recv(4 - len(header))
-
-        if not data:
-            print("Rust disconnected")
-            break
-
-        header += data
-
-    if len(header) < 4:
-        break
-
-    frame_size = struct.unpack("!I", header)[0]
-
-    t2 = time.perf_counter()
+# Recovery jobs waiting for the RIFE worker.
+# If RIFE cannot keep up, new jobs are dropped instead of
+# blocking the socket and starving the Rust receiver.
+RECOVERY_QUEUE_SIZE = 8
 
 
-    # ================================================
-    # 2. RECEIVE JPEG
-    # ================================================
+def recv_exact(sock, size):
+    data = bytearray()
 
-    frame_data = bytearray()
+    while len(data) < size:
 
-    while len(frame_data) < frame_size:
-
-        data = sock.recv(
-            min(65536, frame_size - len(frame_data))
+        chunk = sock.recv(
+            min(65536, size - len(data))
         )
 
-        if not data:
+        if not chunk:
+            return None
+
+        data.extend(chunk)
+
+    return data
+
+
+def recovery_worker(jobs, buffer):
+    """
+    Runs RIFE in its own thread so that inference time never blocks
+    reading frames from Rust.
+
+    Each job is (previous_frame, next_frame, missing_ids).
+    """
+
+    # Load RIFE once, before the first real missing frame.
+    try:
+        warm_up()
+    except Exception as error:
+        print(f"RIFE warm-up failed: {error}")
+
+    while True:
+
+        job = jobs.get()
+
+        if job is None:
+            break
+
+        previous_frame, next_frame, missing_ids = job
+
+        total_missing = len(missing_ids)
+
+        for position, missing_id in enumerate(missing_ids, start=1):
+
+            metrics.add("recovery_attempts")
+
+            start = time.perf_counter()
+
+            recovered_frame = frame_recovery(
+                previous_frame,
+                next_frame,
+                position,
+                total_missing
+            )
+
+            metrics.add_recovery_time(time.perf_counter() - start)
+
+            if recovered_frame is not None:
+
+                buffer.add_frame(missing_id, recovered_frame)
+
+                metrics.add("recovery_successes")
+
+                print(f"Frame {missing_id} | RECOVERED -> BUFFER")
+
+            else:
+
+                metrics.add("recovery_failures")
+
+                print(f"Frame {missing_id} | RECOVERY FAILED")
+
+
+def receive_frames(buffer):
+
+    sock = socket.socket(
+        socket.AF_INET,
+        socket.SOCK_STREAM
+    )
+
+    sock.connect((HOST, PORT))
+
+    print("Connected to Rust receiver")
+    print("Waiting for frames...")
+
+    jobs = queue.Queue(maxsize=RECOVERY_QUEUE_SIZE)
+
+    worker = threading.Thread(
+        target=recovery_worker,
+        args=(jobs, buffer),
+        daemon=True
+    )
+
+    worker.start()
+
+    # Last successfully received complete frame
+    previous_frame = None
+    previous_frame_id = None
+
+    # Number of MISSING reports from Rust since the last complete frame
+    # (used for logging and metrics only; the recovery window itself is
+    # computed from frame ids, see below).
+    reported_missing = 0
+
+    while True:
+
+        # Read 9-byte Rust -> Python message header
+        #
+        # [0..4] : frame_id     (4 bytes)
+        # [4]    : status       (1 byte)
+        # [5..9] : frame_size   (4 bytes)
+        #
+        # status:
+        # 0 = COMPLETE
+        # 1 = MISSING
+
+        header = recv_exact(sock, 9)
+
+        if header is None:
             print("Rust disconnected")
             break
 
-        frame_data.extend(data)
+        frame_id = struct.unpack("!I", header[0:4])[0]
 
-    if len(frame_data) < frame_size:
-        break
+        status = header[4]
 
-    t3 = time.perf_counter()
+        frame_size = struct.unpack("!I", header[5:9])[0]
 
+        # Missing frame
 
-    # ================================================
-    # 3. JPEG → NUMPY
-    # ================================================
+        if status == 1:
 
-    image_buffer = np.frombuffer(
-        frame_data,
-        dtype=np.uint8
-    )
+            print(f"Frame {frame_id} | MISSING")
 
+            reported_missing += 1
 
-    # ================================================
-    # 4. JPEG DECODE
-    # ================================================
+            continue
 
-    frame = cv2.imdecode(
-        image_buffer,
-        cv2.IMREAD_COLOR
-    )
+        # Unknown status
 
-    t4 = time.perf_counter()
+        if status != 0:
 
-    if frame is None:
-        print("JPEG decode failed")
-        continue
+            print(f"Unknown frame status: {status}")
 
+            break
 
-    # ================================================
-    # 5. DISPLAY
-    # ================================================
+        # Complete frame
 
-    cv2.imshow(
-        "UDP Video Stream",
-        frame
-    )
+        frame_data = recv_exact(sock, frame_size)
 
-    key = cv2.waitKey(1) & 0xFF
+        if frame_data is None:
 
-    t5 = time.perf_counter()
+            print("Rust disconnected while receiving JPEG")
 
+            break
 
-    # ================================================
-    # TIMINGS
-    # ================================================
+        # JPEG -> OpenCV frame
 
-    print(
-        f"Frame {frame_count} | "
-        f"Size: {frame_size / 1024:.1f} KB | "
-        f"TCP recv: {(t3 - t1) * 1000:.2f} ms | "
-        f"Decode: {(t4 - t3) * 1000:.2f} ms | "
-        f"Display: {(t5 - t4) * 1000:.2f} ms"
-    )
+        frame = construct_frame(frame_data)
 
+        if frame is None:
 
-    frame_count += 1
+            print(f"Frame {frame_id} | JPEG decode failed")
 
-    elapsed = time.time() - start_time
+            continue
 
-    if elapsed >= 1.0:
+        metrics.add("complete_frames")
+
+        # Work out which frames lie between the previous complete frame
+        # and this one.
+        #
+        # Using frame ids (instead of only the MISSING messages) also
+        # covers frames that lost every packet and so were never
+        # reported by Rust.
+
+        if previous_frame is None:
+
+            # No temporal reference yet, so nothing can be recovered.
+            if reported_missing:
+                print(
+                    f"Cannot recover {reported_missing} "
+                    f"frame(s): no previous complete frame"
+                )
+
+        elif frame_id > previous_frame_id + 1:
+
+            missing_ids = list(
+                range(previous_frame_id + 1, frame_id)
+            )
+
+            metrics.add("missing_frames", len(missing_ids))
+
+            if len(missing_ids) > MAX_PENDING_MISSING:
+
+                print(
+                    f"{len(missing_ids)} consecutive missing frames "
+                    f"(limit {MAX_PENDING_MISSING}). "
+                    f"Discarding recovery window."
+                )
+
+                metrics.add("recovery_windows_discarded")
+
+            else:
+
+                print(
+                    f"Recovering {len(missing_ids)} missing frame(s) "
+                    f"using frames {previous_frame_id} and {frame_id}"
+                )
+
+                try:
+
+                    jobs.put_nowait(
+                        (previous_frame, frame, missing_ids)
+                    )
+
+                except queue.Full:
+
+                    print("Recovery queue full. Window dropped.")
+
+                    metrics.add("recovery_windows_discarded")
+
+        reported_missing = 0
+
+        # Add the real complete frame to the buffer
+
+        buffer.add_frame(frame_id, frame)
 
         print(
-            f"========== FPS: {frame_count / elapsed:.2f} =========="
+            f"Frame {frame_id} | COMPLETE -> BUFFER | "
+            f"Buffer size: {buffer.size()}"
         )
 
-        frame_count = 0
-        start_time = time.time()
+        # This becomes the previous temporal frame
+        # for the next recovery window.
 
+        previous_frame = frame
+        previous_frame_id = frame_id
 
-    if key == ord("q"):
-        break
+    jobs.put(None)
 
-
-sock.close()
-cv2.destroyAllWindows()
+    sock.close()
